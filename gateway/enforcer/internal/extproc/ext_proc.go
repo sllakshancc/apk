@@ -168,6 +168,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 		dynamicMetadataKeyValuePairs := make(map[string]string)
 		switch v := req.Request.(type) {
 		case *envoy_service_proc_v3.ProcessingRequest_RequestHeaders:
+			s.log.Info("Processing request header")
 			requestConfigHolder := &requestconfig.Holder{}
 			attributes, err := extractExternalProcessingXDSRouteMetadataAttributes(req.GetAttributes())
 			if err != nil {
@@ -271,6 +272,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			}
 
 		case *envoy_service_proc_v3.ProcessingRequest_RequestBody:
+			s.log.Info("Processing request body")
 			// httpBody := req.GetRequestBody()
 			s.log.Info("Request Body Flow")
 			resp.Response = &envoy_service_proc_v3.ProcessingResponse_RequestBody{
@@ -494,6 +496,13 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 					ResponseHeaders: rhq,
 				},
 			}
+			attributes, err := extractExternalProcessingXDSRouteMetadataAttributes(req.GetAttributes())
+			if err != nil {
+				s.log.Error(err, "failed to extract context attributes in response header")
+				break
+			}
+			s.log.Info(fmt.Sprintf("RequestID at response header: %v", attributes.RequestID))
+
 			metadata, err := extractExternalProcessingMetadata(req.GetMetadataContext())
 			if err != nil {
 				s.log.Error(err, "failed to extract context metadata")
@@ -608,6 +617,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				}
 			}
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseBody:
+			s.log.Info("Processing response body")
 			// httpBody := req.GetResponseBody()
 			// s.log.Info(fmt.Sprintf("req holder: %+v\n s: %+v", &s.requestConfigHolder, &s))
 			s.log.Info("Response Body Flow")
@@ -821,6 +831,22 @@ func extractExternalProcessingXDSRouteMetadataAttributes(data map[string]*struct
 	if field, ok := fields["request.method"]; ok {
 		method := field.GetStringValue()
 		attributes.RequestMethod = method
+	}
+
+	if field, ok := fields["request.id"]; ok {
+		id := field.GetStringValue()
+		attributes.RequestID = id
+		fmt.Printf("request id found %v\n", id)
+	} else {
+		fmt.Printf("request id not found\n")
+	}
+
+	if field, ok := fields["request.id"]; ok {
+		id := field.GetStringValue()
+		attributes.RequestID = id
+		fmt.Printf("request id found %v\n", id)
+	} else {
+		fmt.Printf("request id not found\n")
 	}
 
 	// We need to navigate through the nested fields to get the actual values
