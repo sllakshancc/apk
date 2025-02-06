@@ -185,6 +185,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				}
 				break
 			}
+			s.log.Info(fmt.Sprintf("RequestID at request header: %v", attributes.RequestID))
 			rhq := &envoy_service_proc_v3.HeadersResponse{
 				Response: &envoy_service_proc_v3.CommonResponse{
 					HeaderMutation: &envoy_service_proc_v3.HeaderMutation{
@@ -821,6 +822,14 @@ func extractExternalProcessingXDSRouteMetadataAttributes(data map[string]*struct
 	if field, ok := fields["request.method"]; ok {
 		method := field.GetStringValue()
 		attributes.RequestMethod = method
+	}
+
+	if field, ok := fields["request.id"]; ok {
+		id := field.GetStringValue()
+		attributes.RequestID = id
+		fmt.Printf("request id found %v\n", id)
+	} else {
+		fmt.Printf("request id not found\n")
 	}
 
 	// We need to navigate through the nested fields to get the actual values
