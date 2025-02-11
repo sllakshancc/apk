@@ -42,7 +42,7 @@ func main() {
 	// NewJWTTransformer creates a new instance of JWTTransformer.
 	jwtTransformer := transformer.NewJWTTransformer(jwtIssuerDatastore)
 	// Create new cache store and incomingstorecachekeystore
-	cacheStore := datastore.NewMockCache()
+	cacheStore := datastore.NewRedisCache()
 	incomingRequestCacheKeyStore := datastore.NewIncomingRequestCacheKeyStore()
 	// Start the external processing server
 	go extproc.StartExternalProcessingServer(cfg, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, jwtTransformer, modelBasedRoundRobinTracker)

@@ -805,7 +805,10 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				} else {
 					responseValue := llmResponse.JSON.Value
 					if responseValue != "" {
-						s.cacheStore.Set(cacheKey, responseValue)
+						err := s.cacheStore.Set(cacheKey, responseValue)
+						if err != nil {
+							s.cfg.Logger.Error(err, "Error setting cached value")
+						}
 					} else {
 						s.cfg.Logger.Error(err, "value not found in response")
 					}
