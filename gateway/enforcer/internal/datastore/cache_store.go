@@ -46,3 +46,38 @@ func NewMockCache() *MockCache {
 		store: make(map[string]string),
 	}
 }
+
+// IncomingRequestCacheKeyStore defines store cache key store
+type IncomingRequestCacheKeyStore struct {
+	keys map[string]string
+	mu   sync.RWMutex
+}
+
+// NewIncomingRequestCacheKeyStore Initiate new cache key store
+func NewIncomingRequestCacheKeyStore() *IncomingRequestCacheKeyStore {
+	return &IncomingRequestCacheKeyStore{
+		keys: make(map[string]string),
+	}
+}
+
+// Set Incoming request cache key
+func (s *IncomingRequestCacheKeyStore) Set(requestID string, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keys[requestID] = key
+	fmt.Printf("[IncomingRequestCacheKeyStore] SET requestID=%q -> key=%q\n", requestID, key)
+	return nil
+}
+
+// Pop the request cache key.
+func (s *IncomingRequestCacheKeyStore) Pop(requestID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, exists := s.keys[requestID]
+	fmt.Printf("[IncomingRequestCacheKeyStore] POP requestID=%q -> key=%q, exists=%v\n", requestID, key, exists)
+	if !exists {
+		return "", false
+	}
+	delete(s.keys, requestID)
+	return key, true
+}

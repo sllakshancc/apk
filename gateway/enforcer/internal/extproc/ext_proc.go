@@ -56,6 +56,8 @@ type ExternalProcessingServer struct {
 	log                              logging.Logger
 	apiStore                         *datastore.APIStore
 	subscriptionApplicationDatastore *datastore.SubscriptionApplicationDataStore
+	cacheStore                       datastore.CacheStore
+	incomingRequestCacheKeyStore     *datastore.IncomingRequestCacheKeyStore
 	ratelimitHelper                  *ratelimit.AIRatelimitHelper
 	requestConfigHolder              *requestconfig.Holder
 	cfg                              *config.Server
@@ -87,6 +89,7 @@ const (
 	matchedResourceMetadataKey                      string = "request:matchedresource"
 	matchedSubscriptionMetadataKey                  string = "request:matchedsubscription"
 	matchedApplicationMetadataKey                   string = "request:matchedapplication"
+	requestIDMetadataKey                            string = "request:requestid"
 
 	modelMetadataKey string = "aitoken:model"
 )
@@ -102,7 +105,7 @@ var httpHandler requesthandler.HTTP = requesthandler.HTTP{}
 //     public and private keys, and a logger instance.
 //
 // If there is an error during the creation of the gRPC server, the function will panic.
-func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
+func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, cacheStore datastore.CacheStore, incomingRequestCacheKeyStore *datastore.IncomingRequestCacheKeyStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
 	kaParams := keepalive.ServerParameters{
 		Time:    time.Duration(cfg.ExternalProcessingKeepAliveTime) * time.Hour, // Ping the client if it is idle for 2 hours
 		Timeout: 20 * time.Second,
@@ -117,7 +120,7 @@ func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APISt
 	}
 
 	ratelimitHelper := ratelimit.NewAIRatelimitHelper(cfg)
-	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
+	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.ExternalProcessingPort))
 	if err != nil {
 		cfg.Logger.Error(err, fmt.Sprintf("Failed to listen on port: %s", cfg.ExternalProcessingPort))
@@ -168,6 +171,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 		dynamicMetadataKeyValuePairs := make(map[string]string)
 		switch v := req.Request.(type) {
 		case *envoy_service_proc_v3.ProcessingRequest_RequestHeaders:
+			s.log.Info("\n\n\nProcessing request header")
 			requestConfigHolder := &requestconfig.Holder{}
 			attributes, err := extractExternalProcessingXDSRouteMetadataAttributes(req.GetAttributes())
 			if err != nil {
@@ -186,6 +190,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				break
 			}
 			s.log.Info(fmt.Sprintf("RequestID at request header: %v", attributes.RequestID))
+			dynamicMetadataKeyValuePairs[requestIDMetadataKey] = attributes.RequestID
 			rhq := &envoy_service_proc_v3.HeadersResponse{
 				Response: &envoy_service_proc_v3.CommonResponse{
 					HeaderMutation: &envoy_service_proc_v3.HeaderMutation{
@@ -272,6 +277,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			}
 
 		case *envoy_service_proc_v3.ProcessingRequest_RequestBody:
+			s.log.Info("\n\n\nProcessing request body")
 			// httpBody := req.GetRequestBody()
 			s.log.Info("Request Body Flow")
 			resp.Response = &envoy_service_proc_v3.ProcessingResponse_RequestBody{
@@ -485,7 +491,65 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 					s.cfg.Logger.Info(fmt.Sprintf("request body after %+v\n", newHTTPBody))
 				}
 			}
+			// handling cache
+			// change request body to model to selected model
+			httpBody := req.GetRequestBody().Body
+			s.cfg.Logger.Info(fmt.Sprintf("request body before %+v\n", httpBody))
+			// Define a map to hold the JSON data
+			var jsonData map[string]interface{}
+			// Unmarshal the JSON data into the map
+			if err := json.Unmarshal(httpBody, &jsonData); err != nil {
+				s.log.Error(err, "Error unmarshaling JSON Reuqest Body")
+			}
+			s.cfg.Logger.Info(fmt.Sprintf("jsonData %+v\n", jsonData))
+
+			key, exists := jsonData["key"]
+			if exists {
+				cachedReply, err := s.cacheStore.Get(key.(string))
+				if err == nil {
+					s.cfg.Logger.Info(fmt.Sprintf("cache hit: reply %+v\n", cachedReply))
+					newHTTPBody := []byte(fmt.Sprintf(`{"reply":"%s"}`, cachedReply))
+					newBodyLength := len(newHTTPBody)
+					headers := &envoy_service_proc_v3.HeaderMutation{
+						SetHeaders: []*corev3.HeaderValueOption{
+							{
+								Header: &corev3.HeaderValue{
+									Key:      "Content-Length",
+									RawValue: []byte(fmt.Sprintf("%d", newBodyLength)), // Set the new Content-Length
+								},
+							},
+							{
+								Header: &corev3.HeaderValue{
+									Key:      "Content-Type",
+									RawValue: []byte("application/json"), // Ensuring correct Content-Type
+								},
+							},
+							{
+								Header: &corev3.HeaderValue{
+									Key:      "X-Cache-Status",
+									RawValue: []byte("HIT"), // Indicating that this is a cached response
+								},
+							},
+						},
+					}
+
+					rbq := &envoy_service_proc_v3.ImmediateResponse{
+						Status: &v32.HttpStatus{
+							Code: v32.StatusCode_OK,
+						},
+						Headers: headers, // Add header mutation here
+						Body:    newHTTPBody,
+					}
+					s.cfg.Logger.Info(fmt.Sprintf("rbq %+v\n", rbq))
+					resp.Response = &envoy_service_proc_v3.ProcessingResponse_ImmediateResponse{
+						ImmediateResponse: rbq,
+					}
+				} else {
+					s.incomingRequestCacheKeyStore.Set(metadata.RequestIdentifier, key.(string))
+				}
+			}
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseHeaders:
+			s.log.Info("\n\n\nProcessing response header")
 			s.log.Info(fmt.Sprintf("response header %+v, ", v.ResponseHeaders))
 			rhq := &envoy_service_proc_v3.HeadersResponse{
 				Response: &envoy_service_proc_v3.CommonResponse{},
@@ -609,6 +673,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				}
 			}
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseBody:
+			s.log.Info("\n\n\nProcessing response body")
 			// httpBody := req.GetResponseBody()
 			// s.log.Info(fmt.Sprintf("req holder: %+v\n s: %+v", &s.requestConfigHolder, &s))
 			s.log.Info("Response Body Flow")
@@ -725,6 +790,28 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				duration := matchedResource.AIModelBasedRoundRobin.OnQuotaExceedSuspendDuration
 				s.modelBasedRoundRobinTracker.SuspendModel(matchedAPI.UUID, matchedResource.Path, model, time.Duration(time.Duration(duration*1000*1000*1000)))
 			}
+
+			// handle caching response
+			cacheKey, cacheKeyExists := s.incomingRequestCacheKeyStore.Pop(metadata.RequestIdentifier)
+			if cacheKeyExists {
+				var llmResponse dto.LLMResponse
+				httpBody := req.GetResponseBody().Body
+				uncompressedBody, err := util.DecompressIfGzip(httpBody)
+				if err != nil {
+					s.cfg.Logger.Error(err, "Error decompressing response body")
+				}
+				if err := json.Unmarshal(uncompressedBody, &llmResponse); err != nil {
+					s.cfg.Logger.Error(err, "Error unmarshaling JSON Response Body")
+				} else {
+					responseValue := llmResponse.JSON.Value
+					if responseValue != "" {
+						s.cacheStore.Set(cacheKey, responseValue)
+					} else {
+						s.cfg.Logger.Error(err, "value not found in response")
+					}
+				}
+			}
+
 		default:
 			s.log.Info(fmt.Sprintf("Unknown Request type %v\n", v))
 		}
@@ -798,6 +885,9 @@ func extractExternalProcessingMetadata(data *corev3.Metadata) (*dto.ExternalProc
 			}
 			if matchedSubscriptionKey, exists := extProcMetadata.Fields[matchedSubscriptionMetadataKey]; exists {
 				externalProcessingEnvoyMetadata.MatchedSubscriptionIdentifier = matchedSubscriptionKey.GetStringValue()
+			}
+			if requestID, exists := extProcMetadata.Fields[requestIDMetadataKey]; exists {
+				externalProcessingEnvoyMetadata.RequestIdentifier = requestID.GetStringValue()
 			}
 
 		}
