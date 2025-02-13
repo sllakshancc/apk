@@ -28,6 +28,7 @@ import (
 	v32 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/wso2/apk/gateway/enforcer/internal/analytics"
 	"github.com/wso2/apk/gateway/enforcer/internal/authorization"
+	"github.com/wso2/apk/gateway/enforcer/internal/cache"
 	"github.com/wso2/apk/gateway/enforcer/internal/config"
 	"github.com/wso2/apk/gateway/enforcer/internal/datastore"
 	"github.com/wso2/apk/gateway/enforcer/internal/dto"
@@ -491,63 +492,12 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 					s.cfg.Logger.Info(fmt.Sprintf("request body after %+v\n", newHTTPBody))
 				}
 			}
-			// handling cache
-			// change request body to model to selected model
-			httpBody := req.GetRequestBody().Body
-			s.cfg.Logger.Info(fmt.Sprintf("request body before %+v\n", httpBody))
-			// Define a map to hold the JSON data
-			var jsonData map[string]interface{}
-			// Unmarshal the JSON data into the map
-			if err := json.Unmarshal(httpBody, &jsonData); err != nil {
-				s.log.Error(err, "Error unmarshaling JSON Reuqest Body")
-			}
-			s.cfg.Logger.Info(fmt.Sprintf("jsonData %+v\n", jsonData))
 
-			key, exists := jsonData["key"]
-			if exists {
-				cachedReply, err := s.cacheStore.Get(key.(string))
-				if err == nil {
-					s.cfg.Logger.Info(fmt.Sprintf("cache hit: reply %+v\n", cachedReply))
-					newHTTPBody := []byte(fmt.Sprintf(`{"reply":"%s"}`, cachedReply))
-					newBodyLength := len(newHTTPBody)
-					headers := &envoy_service_proc_v3.HeaderMutation{
-						SetHeaders: []*corev3.HeaderValueOption{
-							{
-								Header: &corev3.HeaderValue{
-									Key:      "Content-Length",
-									RawValue: []byte(fmt.Sprintf("%d", newBodyLength)), // Set the new Content-Length
-								},
-							},
-							{
-								Header: &corev3.HeaderValue{
-									Key:      "Content-Type",
-									RawValue: []byte("application/json"), // Ensuring correct Content-Type
-								},
-							},
-							{
-								Header: &corev3.HeaderValue{
-									Key:      "X-Cache-Status",
-									RawValue: []byte("HIT"), // Indicating that this is a cached response
-								},
-							},
-						},
-					}
+			// HANDLE CACHE
+			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
+			// TODO: make sure RequestIdentifier exists
+			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
 
-					rbq := &envoy_service_proc_v3.ImmediateResponse{
-						Status: &v32.HttpStatus{
-							Code: v32.StatusCode_OK,
-						},
-						Headers: headers, // Add header mutation here
-						Body:    newHTTPBody,
-					}
-					s.cfg.Logger.Info(fmt.Sprintf("rbq %+v\n", rbq))
-					resp.Response = &envoy_service_proc_v3.ProcessingResponse_ImmediateResponse{
-						ImmediateResponse: rbq,
-					}
-				} else {
-					s.incomingRequestCacheKeyStore.Set(metadata.RequestIdentifier, key.(string))
-				}
-			}
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseHeaders:
 			s.log.Info("\n\n\nProcessing response header")
 			s.log.Info(fmt.Sprintf("response header %+v, ", v.ResponseHeaders))
@@ -791,29 +741,10 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				s.modelBasedRoundRobinTracker.SuspendModel(matchedAPI.UUID, matchedResource.Path, model, time.Duration(time.Duration(duration*1000*1000*1000)))
 			}
 
-			// handle caching response
-			cacheKey, cacheKeyExists := s.incomingRequestCacheKeyStore.Pop(metadata.RequestIdentifier)
-			if cacheKeyExists {
-				var llmResponse dto.LLMResponse
-				httpBody := req.GetResponseBody().Body
-				uncompressedBody, err := util.DecompressIfGzip(httpBody)
-				if err != nil {
-					s.cfg.Logger.Error(err, "Error decompressing response body")
-				}
-				if err := json.Unmarshal(uncompressedBody, &llmResponse); err != nil {
-					s.cfg.Logger.Error(err, "Error unmarshaling JSON Response Body")
-				} else {
-					responseValue := llmResponse.JSON.Value
-					if responseValue != "" {
-						err := s.cacheStore.Set(cacheKey, responseValue)
-						if err != nil {
-							s.cfg.Logger.Error(err, "Error setting cached value")
-						}
-					} else {
-						s.cfg.Logger.Error(err, "value not found in response")
-					}
-				}
-			}
+			// HANDLE CACHE
+			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
+			// TODO: make sure RequestIdentifier exists
+			cache.HandleHTTPResponseBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
 
 		default:
 			s.log.Info(fmt.Sprintf("Unknown Request type %v\n", v))
