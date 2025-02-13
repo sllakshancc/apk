@@ -172,7 +172,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 		dynamicMetadataKeyValuePairs := make(map[string]string)
 		switch v := req.Request.(type) {
 		case *envoy_service_proc_v3.ProcessingRequest_RequestHeaders:
-			s.log.Info("\n\n\nProcessing request header")
 			requestConfigHolder := &requestconfig.Holder{}
 			attributes, err := extractExternalProcessingXDSRouteMetadataAttributes(req.GetAttributes())
 			if err != nil {
@@ -190,7 +189,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				}
 				break
 			}
-			s.log.Info(fmt.Sprintf("RequestID at request header: %v", attributes.RequestID))
 			dynamicMetadataKeyValuePairs[requestIDMetadataKey] = attributes.RequestID
 			rhq := &envoy_service_proc_v3.HeadersResponse{
 				Response: &envoy_service_proc_v3.CommonResponse{
@@ -278,7 +276,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			}
 
 		case *envoy_service_proc_v3.ProcessingRequest_RequestBody:
-			s.log.Info("\n\n\nProcessing request body")
 			// httpBody := req.GetRequestBody()
 			s.log.Info("Request Body Flow")
 			resp.Response = &envoy_service_proc_v3.ProcessingResponse_RequestBody{
@@ -499,7 +496,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
 
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseHeaders:
-			s.log.Info("\n\n\nProcessing response header")
 			s.log.Info(fmt.Sprintf("response header %+v, ", v.ResponseHeaders))
 			rhq := &envoy_service_proc_v3.HeadersResponse{
 				Response: &envoy_service_proc_v3.CommonResponse{},
@@ -623,7 +619,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				}
 			}
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseBody:
-			s.log.Info("\n\n\nProcessing response body")
 			// httpBody := req.GetResponseBody()
 			// s.log.Info(fmt.Sprintf("req holder: %+v\n s: %+v", &s.requestConfigHolder, &s))
 			s.log.Info("Response Body Flow")
@@ -851,9 +846,6 @@ func extractExternalProcessingXDSRouteMetadataAttributes(data map[string]*struct
 	if field, ok := fields["request.id"]; ok {
 		id := field.GetStringValue()
 		attributes.RequestID = id
-		fmt.Printf("request id found %v\n", id)
-	} else {
-		fmt.Printf("request id not found\n")
 	}
 
 	// We need to navigate through the nested fields to get the actual values
