@@ -1,29 +1,52 @@
 package dto
 
-// LLMResponse defines llm response structure
-type LLMResponse struct {
-	JSON struct {
-		Value string `json:"value"`
-	} `json:"json"`
-}
-
-// LLMRequest defines llm Request structure
+// LLMRequest defines the OpenAI request structure
 type LLMRequest struct {
-	Key string `json:"key"`
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
 }
 
-// GetValue Get the value from llm response
-func (r *LLMResponse) GetValue() (string, bool) {
-	if r.JSON.Value == "" {
-		return "", false
-	}
-	return r.JSON.Value, true
+// Message represents a single message in the OpenAI request
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-// GetKey Get the key from llm response
+// LLMResponse defines the OpenAI response structure
+type LLMResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Usage   Usage    `json:"usage"`
+	Choices []Choice `json:"choices"`
+}
+
+// Usage represents token usage details
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// Choice represents a completion choice from OpenAI
+type Choice struct {
+	Index   int     `json:"index"`
+	Message Message `json:"message"`
+}
+
+// GetKey extracts the last message's content (key) from the request
 func (r *LLMRequest) GetKey() (string, bool) {
-	if r.Key == "" {
+	if len(r.Messages) == 0 || r.Messages[len(r.Messages)-1].Content == "" {
 		return "", false
 	}
-	return r.Key, true
+	return r.Messages[len(r.Messages)-1].Content, true
+}
+
+// GetValue extracts the assistant's response content (value) from the response
+func (r *LLMResponse) GetValue() (string, bool) {
+	if len(r.Choices) == 0 || r.Choices[0].Message.Content == "" {
+		return "", false
+	}
+	return r.Choices[0].Message.Content, true
 }
