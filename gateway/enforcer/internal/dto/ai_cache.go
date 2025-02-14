@@ -31,8 +31,10 @@ type Usage struct {
 
 // Choice represents a completion choice from OpenAI
 type Choice struct {
-	Index   int     `json:"index"`
-	Message Message `json:"message"`
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	Delta        []any   `json:"delta"`
+	FinishReason string  `json:"finish_reason"`
 }
 
 // GetKey extracts the last message's content (key) from the request
