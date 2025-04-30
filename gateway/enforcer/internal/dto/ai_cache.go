@@ -39,6 +39,7 @@ type Choice struct {
 
 // GetKey extracts the last message's content (key) from the request
 func (r *LLMRequest) GetKey() (string, bool) {
+	//TODO: trim key
 	if len(r.Messages) == 0 || r.Messages[len(r.Messages)-1].Content == "" {
 		return "", false
 	}
@@ -47,6 +48,7 @@ func (r *LLMRequest) GetKey() (string, bool) {
 
 // GetValue extracts the assistant's response content (value) from the response
 func (r *LLMResponse) GetValue() (string, bool) {
+	//TODO: trim value
 	if len(r.Choices) == 0 || r.Choices[0].Message.Content == "" {
 		return "", false
 	}

@@ -62,6 +62,8 @@ type ExternalProcessingServer struct {
 	apiStore                         *datastore.APIStore
 	subscriptionApplicationDatastore *datastore.SubscriptionApplicationDataStore
 	cacheStore                       datastore.CacheStore
+	vectorStore                      cache.VectorProvider
+	embeddingProvider                cache.EmbeddingProvider
 	incomingRequestCacheKeyStore     *datastore.IncomingRequestCacheKeyStore
 	ratelimitHelper                  *ratelimit.AIRatelimitHelper
 	requestConfigHolder              *requestconfig.Holder
@@ -111,7 +113,7 @@ var httpHandler requesthandler.HTTP = requesthandler.HTTP{}
 //     public and private keys, and a logger instance.
 //
 // If there is an error during the creation of the gRPC server, the function will panic.
-func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, cacheStore datastore.CacheStore, incomingRequestCacheKeyStore *datastore.IncomingRequestCacheKeyStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
+func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, cacheStore datastore.CacheStore, vectorStore cache.VectorProvider, embeddingProvider cache.EmbeddingProvider, incomingRequestCacheKeyStore *datastore.IncomingRequestCacheKeyStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
 	kaParams := keepalive.ServerParameters{
 		Time:    time.Duration(cfg.ExternalProcessingKeepAliveTime) * time.Hour, // Ping the client if it is idle for 2 hours
 		Timeout: 20 * time.Second,
@@ -126,7 +128,7 @@ func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APISt
 	}
 
 	ratelimitHelper := ratelimit.NewAIRatelimitHelper(cfg)
-	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
+	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, cacheStore, vectorStore, embeddingProvider, incomingRequestCacheKeyStore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.ExternalProcessingPort))
 	if err != nil {
 		cfg.Logger.Error(err, fmt.Sprintf("Failed to listen on port: %s", cfg.ExternalProcessingPort))
@@ -632,7 +634,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			// HANDLE CACHE
 			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
 			// TODO: make sure RequestIdentifier exists
-			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
+			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.vectorStore, s.embeddingProvider, s.incomingRequestCacheKeyStore, req, resp)
 
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseHeaders:
 			s.log.Info(fmt.Sprintf("response header %+v, ", v.ResponseHeaders))
@@ -890,7 +892,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			// HANDLE CACHE
 			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
 			// TODO: make sure RequestIdentifier exists
-			cache.HandleHTTPResponseBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
+			cache.HandleHTTPResponseBody(metadata.RequestIdentifier, s.cacheStore, s.vectorStore, s.embeddingProvider, s.incomingRequestCacheKeyStore, req, resp)
 
 		default:
 			s.log.Info(fmt.Sprintf("Unknown Request type %v\n", v))

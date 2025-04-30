@@ -5,6 +5,7 @@ import (
 
 	"strings"
 
+	"github.com/wso2/apk/gateway/enforcer/internal/cache"
 	"github.com/wso2/apk/gateway/enforcer/internal/config"
 	"github.com/wso2/apk/gateway/enforcer/internal/datastore"
 	"github.com/wso2/apk/gateway/enforcer/internal/extproc"
@@ -43,9 +44,11 @@ func main() {
 	jwtTransformer := transformer.NewJWTTransformer(jwtIssuerDatastore)
 	// Create new cache store and incomingstorecachekeystore
 	cacheStore := datastore.NewRedisCache()
+	vectorStore, _ := cache.NewMilvusVectorProvider()
+	embeddingProvider := cache.CreateNewSBERTProvider()
 	incomingRequestCacheKeyStore := datastore.NewIncomingRequestCacheKeyStore()
 	// Start the external processing server
-	go extproc.StartExternalProcessingServer(cfg, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, jwtTransformer, modelBasedRoundRobinTracker)
+	go extproc.StartExternalProcessingServer(cfg, apiStore, subAppDatastore, cacheStore, vectorStore, embeddingProvider, incomingRequestCacheKeyStore, jwtTransformer, modelBasedRoundRobinTracker)
 
 	// Wait for the config to be loaded
 	cfg.Logger.Info("Waiting for the config to be loaded")
