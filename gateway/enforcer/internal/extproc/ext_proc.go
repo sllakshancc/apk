@@ -18,6 +18,8 @@
 package extproc
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,12 +28,14 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_service_proc_v3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	v32 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"github.com/wso2/apk/common-go-libs/loggers"
 	"github.com/wso2/apk/gateway/enforcer/internal/analytics"
 	"github.com/wso2/apk/gateway/enforcer/internal/authorization"
 	"github.com/wso2/apk/gateway/enforcer/internal/cache"
 	"github.com/wso2/apk/gateway/enforcer/internal/config"
 	"github.com/wso2/apk/gateway/enforcer/internal/datastore"
 	"github.com/wso2/apk/gateway/enforcer/internal/dto"
+	"github.com/wso2/apk/gateway/enforcer/internal/graphql"
 	"github.com/wso2/apk/gateway/enforcer/internal/jwtbackend"
 	"github.com/wso2/apk/gateway/enforcer/internal/logging"
 	"github.com/wso2/apk/gateway/enforcer/internal/ratelimit"
@@ -58,6 +62,8 @@ type ExternalProcessingServer struct {
 	apiStore                         *datastore.APIStore
 	subscriptionApplicationDatastore *datastore.SubscriptionApplicationDataStore
 	cacheStore                       datastore.CacheStore
+	vectorStore                      cache.VectorProvider
+	embeddingProvider                cache.EmbeddingProvider
 	incomingRequestCacheKeyStore     *datastore.IncomingRequestCacheKeyStore
 	ratelimitHelper                  *ratelimit.AIRatelimitHelper
 	requestConfigHolder              *requestconfig.Holder
@@ -76,6 +82,7 @@ const (
 	clusterNameAttribute                            string = "clusterName"
 	enableBackendBasedAIRatelimitAttribute          string = "enableBackendBasedAIRatelimit"
 	backendBasedAIRatelimitDescriptorValueAttribute string = "backendBasedAIRatelimitDescriptorValue"
+	customOrgMetadataKey                            string = "customorg"
 	suspendAIModelValueAttribute                    string = "ai:suspendmodel"
 	externalProessingMetadataContextKey             string = "envoy.filters.http.ext_proc"
 	subscriptionMetadataKey                         string = "ratelimit:subscription"
@@ -106,7 +113,7 @@ var httpHandler requesthandler.HTTP = requesthandler.HTTP{}
 //     public and private keys, and a logger instance.
 //
 // If there is an error during the creation of the gRPC server, the function will panic.
-func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, cacheStore datastore.CacheStore, incomingRequestCacheKeyStore *datastore.IncomingRequestCacheKeyStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
+func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APIStore, subAppDatastore *datastore.SubscriptionApplicationDataStore, cacheStore datastore.CacheStore, vectorStore cache.VectorProvider, embeddingProvider cache.EmbeddingProvider, incomingRequestCacheKeyStore *datastore.IncomingRequestCacheKeyStore, jwtTransformer *transformer.JWTTransformer, modelBasedRoundRobinTracker *datastore.ModelBasedRoundRobinTracker) {
 	kaParams := keepalive.ServerParameters{
 		Time:    time.Duration(cfg.ExternalProcessingKeepAliveTime) * time.Hour, // Ping the client if it is idle for 2 hours
 		Timeout: 20 * time.Second,
@@ -121,7 +128,7 @@ func StartExternalProcessingServer(cfg *config.Server, apiStore *datastore.APISt
 	}
 
 	ratelimitHelper := ratelimit.NewAIRatelimitHelper(cfg)
-	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
+	envoy_service_proc_v3.RegisterExternalProcessorServer(server, &ExternalProcessingServer{cfg.Logger, apiStore, subAppDatastore, cacheStore, vectorStore, embeddingProvider, incomingRequestCacheKeyStore, ratelimitHelper, nil, cfg, jwtTransformer, modelBasedRoundRobinTracker})
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.ExternalProcessingPort))
 	if err != nil {
 		cfg.Logger.Error(err, fmt.Sprintf("Failed to listen on port: %s", cfg.ExternalProcessingPort))
@@ -211,8 +218,77 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			}
 			apiKey := util.PrepareAPIKey(attributes.VHost, attributes.BasePath, attributes.APIVersion)
 			requestConfigHolder.MatchedAPI = s.apiStore.GetMatchedAPI(util.PrepareAPIKey(attributes.VHost, attributes.BasePath, attributes.APIVersion))
+			dynamicMetadataKeyValuePairs[customOrgMetadataKey] = requestConfigHolder.MatchedAPI.OrganizationID
+
 			dynamicMetadataKeyValuePairs[matchedAPIMetadataKey] = apiKey
+			dynamicMetadataKeyValuePairs[analytics.APITypeKey] = requestConfigHolder.MatchedAPI.APIType
+			dynamicMetadataKeyValuePairs[analytics.APIIDKey] = requestConfigHolder.MatchedAPI.UUID
+			dynamicMetadataKeyValuePairs[analytics.APINameKey] = requestConfigHolder.MatchedAPI.Name
+			dynamicMetadataKeyValuePairs[analytics.APIVersionKey] = requestConfigHolder.MatchedAPI.Version
+			dynamicMetadataKeyValuePairs[analytics.APIContextKey] = requestConfigHolder.MatchedAPI.BasePath
+			dynamicMetadataKeyValuePairs[analytics.APIOrganizationIDKey] = requestConfigHolder.MatchedAPI.OrganizationID
+			dynamicMetadataKeyValuePairs[analytics.APICreatorTenantDomainKey] = requestConfigHolder.MatchedAPI.OrganizationID
+
 			requestConfigHolder.ExternalProcessingEnvoyAttributes = attributes
+			if requestConfigHolder.MatchedAPI != nil && requestConfigHolder.MatchedAPI.APIDefinitionPath != "" {
+				definitionPath := requestConfigHolder.MatchedAPI.APIDefinitionPath
+				fileName := "attachment; filename=\"api_definition.json\""
+				if requestConfigHolder.MatchedAPI.IsGraphQLAPI() {
+					fileName = "attachment; filename=\"api_definition.graphql\""
+				}
+				s.cfg.Logger.Info(fmt.Sprintf("definition Path: %v", definitionPath))
+				fullPath := requestConfigHolder.MatchedAPI.BasePath + requestConfigHolder.MatchedAPI.APIDefinitionPath
+				if attributes.Path == fullPath {
+					definition := requestConfigHolder.MatchedAPI.APIDefinition
+					// Decompress
+					decompressedStr, err := ReadGzip(definition)
+					if err != nil {
+						s.cfg.Logger.Error(err, "Error reading api definition gzip")
+					}
+					s.cfg.Logger.Info(fmt.Sprintf("decompressed definition: %v", decompressedStr))
+					if definition != nil {
+						resp = &envoy_service_proc_v3.ProcessingResponse{
+							Response: &envoy_service_proc_v3.ProcessingResponse_ImmediateResponse{
+								ImmediateResponse: &envoy_service_proc_v3.ImmediateResponse{
+									Status: &v32.HttpStatus{
+										Code: v32.StatusCode(200),
+									},
+									Headers: &envoy_service_proc_v3.HeaderMutation{
+										SetHeaders: []*corev3.HeaderValueOption{
+											{
+												Header: &corev3.HeaderValue{
+													Key:      "Content-Type",
+													RawValue: []byte("application/octet-stream"),
+												},
+											},
+											{
+												Header: &corev3.HeaderValue{
+													Key:      "Content-Disposition",
+													RawValue: []byte(fileName),
+												},
+											},
+										},
+									},
+									Body: []byte(decompressedStr),
+								},
+							},
+						}
+						break
+					}
+				}
+			}
+			s.cfg.Logger.Info(fmt.Sprintf("Metadata context : %+v", req.GetMetadataContext()))
+
+			requestConfigHolder.MatchedResource = httpHandler.GetMatchedResource(requestConfigHolder.MatchedAPI, *requestConfigHolder.ExternalProcessingEnvoyAttributes)
+			if requestConfigHolder.MatchedResource != nil {
+				requestConfigHolder.MatchedResource.RouteMetadataAttributes = attributes
+				dynamicMetadataKeyValuePairs[matchedResourceMetadataKey] = requestConfigHolder.MatchedResource.GetResourceIdentifier()
+				dynamicMetadataKeyValuePairs[analytics.APIResourceTemplateKey] = requestConfigHolder.MatchedResource.Path
+				s.log.Info(fmt.Sprintf("Matched Resource Endpoints: %+v", requestConfigHolder.MatchedResource.Endpoints))
+				if requestConfigHolder.MatchedResource.Endpoints != nil && len(requestConfigHolder.MatchedResource.Endpoints.URLs) > 0 {
+					dynamicMetadataKeyValuePairs[analytics.DestinationKey] = requestConfigHolder.MatchedResource.Endpoints.URLs[0]
+				}
+			}
 			metadata, err := extractExternalProcessingMetadata(req.GetMetadataContext())
 			if err != nil {
 				s.log.Error(err, "failed to extract context metadata")
@@ -220,11 +296,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				break
 			}
 			requestConfigHolder.ExternalProcessingEnvoyMetadata = metadata
-			requestConfigHolder.MatchedResource = httpHandler.GetMatchedResource(requestConfigHolder.MatchedAPI, *requestConfigHolder.ExternalProcessingEnvoyAttributes)
-			if requestConfigHolder.MatchedResource != nil {
-				requestConfigHolder.MatchedResource.RouteMetadataAttributes = attributes
-				dynamicMetadataKeyValuePairs[matchedResourceMetadataKey] = requestConfigHolder.MatchedResource.GetResourceIdentifier()
-			}
+
 			// s.log.Info(fmt.Sprintf("Matched api bjc: %v", requestConfigHolder.MatchedAPI.BackendJwtConfiguration))
 			// s.log.Info(fmt.Sprintf("Matched Resource: %v", requestConfigHolder.MatchedResource))
 			// s.log.Info(fmt.Sprintf("req holderrr: %+v\n s: %+v", &requestConfigHolder, &s))
@@ -247,7 +319,8 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 					break
 				}
 				if requestConfigHolder.MatchedSubscription != nil && requestConfigHolder.MatchedSubscription.RatelimitTier != "Unlimited" && requestConfigHolder.MatchedSubscription.RatelimitTier != "" {
-					dynamicMetadataKeyValuePairs[subscriptionMetadataKey] = requestConfigHolder.MatchedSubscription.UUID
+					loggers.LoggerAPK.Info(fmt.Sprintf("Ratelimit Tier: %s", requestConfigHolder.MatchedSubscription.RatelimitTier))
+					dynamicMetadataKeyValuePairs[subscriptionMetadataKey] = fmt.Sprintf("%s:%s%s", requestConfigHolder.MatchedSubscription.SubscribedAPI.Name, requestConfigHolder.MatchedApplication.UUID, requestConfigHolder.MatchedSubscription.UUID)
 					dynamicMetadataKeyValuePairs[usagePolicyMetadataKey] = requestConfigHolder.MatchedSubscription.RatelimitTier
 					dynamicMetadataKeyValuePairs[organizationMetadataKey] = requestConfigHolder.MatchedAPI.OrganizationID
 					dynamicMetadataKeyValuePairs[orgAndRLPolicyMetadataKey] = fmt.Sprintf("%s-%s", requestConfigHolder.MatchedAPI.OrganizationID, requestConfigHolder.MatchedSubscription.RatelimitTier)
@@ -275,6 +348,58 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				dynamicMetadataKeyValuePairs[matchedSubscriptionMetadataKey] = requestConfigHolder.MatchedSubscription.UUID
 			}
 
+			if requestConfigHolder.MatchedAPI != nil && requestConfigHolder.MatchedAPI.EndpointSecurity != nil {
+				s.cfg.Logger.Info(fmt.Sprintf("Inside API Level Endpoint Security: %+v", requestConfigHolder.MatchedAPI.EndpointSecurity))
+				for _, es := range requestConfigHolder.MatchedAPI.EndpointSecurity {
+					if es.Enabled {
+						s.cfg.Logger.Info(fmt.Sprintf("Enabled API Level Endpoint Security: %+v", es))
+						s.cfg.Logger.Info(fmt.Sprintf("Enabled API Level Security Type: %s", es.SecurityType))
+						if es.SecurityType == "Basic" {
+							basicValue := fmt.Sprintf("Basic %s", util.Base64Encode([]byte(fmt.Sprintf("%s:%s", es.Username, es.Password))))
+							rhq.Response.HeaderMutation.SetHeaders = append(rhq.Response.HeaderMutation.SetHeaders, &corev3.HeaderValueOption{
+								Header: &corev3.HeaderValue{
+									Key:      "Authorization",
+									RawValue: []byte(basicValue),
+								},
+							})
+						} else if es.SecurityType == "APIKey" {
+							rhq.Response.HeaderMutation.SetHeaders = append(rhq.Response.HeaderMutation.SetHeaders, &corev3.HeaderValueOption{
+								Header: &corev3.HeaderValue{
+									Key:      es.CustomParameters["key"],
+									RawValue: []byte(es.CustomParameters["value"]),
+								},
+							})
+						}
+					}
+				}
+			}
+
+			if requestConfigHolder.MatchedResource != nil && requestConfigHolder.MatchedResource.EndpointSecurity != nil {
+				s.cfg.Logger.Info(fmt.Sprintf("Resource Level Endpoint Security: %+v", requestConfigHolder.MatchedResource.EndpointSecurity))
+				for _, es := range requestConfigHolder.MatchedResource.EndpointSecurity {
+					if es.Enabled {
+						s.cfg.Logger.Info(fmt.Sprintf("Resource Level Endpoint Security: %+v", es))
+						s.cfg.Logger.Info(fmt.Sprintf("Resource Level Security Type: %s", es.SecurityType))
+						if es.SecurityType == "Basic" {
+							basicValue := fmt.Sprintf("Basic %s", util.Base64Encode([]byte(fmt.Sprintf("%s:%s", es.Username, es.Password))))
+							rhq.Response.HeaderMutation.SetHeaders = append(rhq.Response.HeaderMutation.SetHeaders, &corev3.HeaderValueOption{
+								Header: &corev3.HeaderValue{
+									Key:      "Authorization",
+									RawValue: []byte(basicValue),
+								},
+							})
+						} else if es.SecurityType == "APIKey" {
+							rhq.Response.HeaderMutation.SetHeaders = append(rhq.Response.HeaderMutation.SetHeaders, &corev3.HeaderValueOption{
+								Header: &corev3.HeaderValue{
+									Key:      es.CustomParameters["key"],
+									RawValue: []byte(es.CustomParameters["value"]),
+								},
+							})
+						}
+					}
+				}
+			}
+
 		case *envoy_service_proc_v3.ProcessingRequest_RequestBody:
 			// httpBody := req.GetRequestBody()
 			s.log.Info("Request Body Flow")
@@ -294,6 +419,22 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			if matchedAPI == nil {
 				s.cfg.Logger.Info(fmt.Sprintf("Matched API not found: %s", metadata.MatchedAPIIdentifier))
 				break
+			}
+
+			if matchedAPI.IsGraphQLAPI() {
+				if immediateResponse := graphql.ValidateGraphQLOperation(matchedAPI, s.jwtTransformer, metadata, s.subscriptionApplicationDatastore, s.cfg, string(req.GetRequestBody().Body)); immediateResponse != nil {
+					resp = &envoy_service_proc_v3.ProcessingResponse{
+						Response: &envoy_service_proc_v3.ProcessingResponse_ImmediateResponse{
+							ImmediateResponse: &envoy_service_proc_v3.ImmediateResponse{
+								Status: &v32.HttpStatus{
+									Code: v32.StatusCode(immediateResponse.StatusCode),
+								},
+								Body: []byte(immediateResponse.Message),
+							},
+						},
+					}
+					break
+				}
 			}
 			matchedResource := matchedAPI.ResourceMap[metadata.MatchedResourceIdentifier]
 			if matchedResource == nil {
@@ -493,7 +634,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			// HANDLE CACHE
 			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
 			// TODO: make sure RequestIdentifier exists
-			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
+			cache.HandleHTTPRequestBody(metadata.RequestIdentifier, s.cacheStore, s.vectorStore, s.embeddingProvider, s.incomingRequestCacheKeyStore, req, resp)
 
 		case *envoy_service_proc_v3.ProcessingRequest_ResponseHeaders:
 			s.log.Info(fmt.Sprintf("response header %+v, ", v.ResponseHeaders))
@@ -562,6 +703,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				s.log.Info(fmt.Sprintf("Header Values: %v", headerValues))
 				remainingTokenCount := 100
 				remainingRequestCount := 100
+				status := 200
 				for _, headerValue := range headerValues {
 					if headerValue.Key == "x-ratelimit-remaining-tokens" {
 						value, err := util.ConvertStringToInt(string(headerValue.RawValue))
@@ -577,8 +719,14 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 						}
 						remainingRequestCount = value
 					}
+					if headerValue.Key == "status" {
+						status, err = util.ConvertStringToInt(string(headerValue.RawValue))
+						if err != nil {
+							s.log.Error(err, "Unable to retrieve status code by header")
+						}
+					}
 				}
-				if remainingTokenCount <= 50 || remainingRequestCount <= 50 { // Suspend model if token/request count reaches 0
+				if remainingTokenCount <= 0 || remainingRequestCount <= 0 || status == 429 { // Suspend model if token/request count reaches 0 or status code is 429
 					s.log.Info("Token/request are exhausted. Suspending the model")
 					matchedResource.RouteMetadataAttributes.SuspendAIModel = "true"
 					matchedAPI.ResourceMap[metadata.MatchedResourceIdentifier] = matchedResource
@@ -595,6 +743,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				s.log.Info(fmt.Sprintf("Header Values: %v", headerValues))
 				remainingTokenCount := 100
 				remainingRequestCount := 100
+				status := 200
 				for _, headerValue := range headerValues {
 					if headerValue.Key == "x-ratelimit-remaining-tokens" {
 						value, err := util.ConvertStringToInt(string(headerValue.RawValue))
@@ -610,8 +759,14 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 						}
 						remainingRequestCount = value
 					}
+					if headerValue.Key == "status" {
+						status, err = util.ConvertStringToInt(string(headerValue.RawValue))
+						if err != nil {
+							s.log.Error(err, "Unable to retrieve status code by header")
+						}
+					}
 				}
-				if remainingTokenCount <= 50 || remainingRequestCount <= 50 { // Suspend model if token/request count reaches 0
+				if remainingTokenCount <= 0 || remainingRequestCount <= 0 || status == 429 { // Suspend model if token/request count reaches 0 or status code is 429
 					s.log.Info("Token/request are exhausted. Suspending the model")
 					matchedResource.RouteMetadataAttributes.SuspendAIModel = "true"
 					matchedAPI.ResourceMap[metadata.MatchedResourceIdentifier] = matchedResource
@@ -656,9 +811,8 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				matchedAPI.AiProvider.PromptTokens != nil &&
 				matchedAPI.AiProvider.TotalToken != nil &&
 				matchedResource.RouteMetadataAttributes != nil &&
-				matchedResource.RouteMetadataAttributes.EnableBackendBasedAIRatelimit == "true" &&
 				matchedAPI.AiProvider.CompletionToken.In == dto.InBody {
-				s.log.Info("Backend based AI rate limit enabled using body")
+				s.log.Info("AI rate limit enabled using body")
 				tokenCount, err := ratelimit.ExtractTokenCountFromExternalProcessingResponseBody(req.GetResponseBody().Body,
 					matchedAPI.AiProvider.PromptTokens.Value,
 					matchedAPI.AiProvider.CompletionToken.Value,
@@ -667,7 +821,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 				if err != nil {
 					s.log.Error(err, "failed to extract token count from response body")
 				} else {
-					go s.ratelimitHelper.DoAIRatelimit(*tokenCount, true,
+					go s.ratelimitHelper.DoAIRatelimit(*tokenCount, matchedResource.RouteMetadataAttributes.EnableBackendBasedAIRatelimit == "true",
 						matchedAPI.DoSubscriptionAIRLInBodyReponse,
 						matchedResource.RouteMetadataAttributes.BackendBasedAIRatelimitDescriptorValue,
 						matchedSubscription, matchedApplication)
@@ -678,7 +832,6 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 					dynamicMetadataKeyValuePairs[analytics.CompletionTokenCountMetadataKey] = strconv.Itoa(tokenCount.Completion)
 					dynamicMetadataKeyValuePairs[analytics.TotalTokenCountMetadataKey] = strconv.Itoa(tokenCount.Total)
 					dynamicMetadataKeyValuePairs[analytics.PromptTokenCountMetadataKey] = strconv.Itoa(tokenCount.Prompt)
-
 				}
 			}
 
@@ -739,7 +892,7 @@ func (s *ExternalProcessingServer) Process(srv envoy_service_proc_v3.ExternalPro
 			// HANDLE CACHE
 			// TODO: add cacheStore and incomingRequestCacheKeyStore in server ext_proc_server
 			// TODO: make sure RequestIdentifier exists
-			cache.HandleHTTPResponseBody(metadata.RequestIdentifier, s.cacheStore, s.incomingRequestCacheKeyStore, req, resp)
+			cache.HandleHTTPResponseBody(metadata.RequestIdentifier, s.cacheStore, s.vectorStore, s.embeddingProvider, s.incomingRequestCacheKeyStore, req, resp)
 
 		default:
 			s.log.Info(fmt.Sprintf("Unknown Request type %v\n", v))
@@ -823,6 +976,29 @@ func extractExternalProcessingMetadata(data *corev3.Metadata) (*dto.ExternalProc
 		return externalProcessingEnvoyMetadata, nil
 	}
 	return nil, fmt.Errorf("could not find the filter metadata")
+}
+
+// ReadGzip decompresses a GZIP-compressed byte slice and returns the string output
+func ReadGzip(gzipData []byte) (string, error) {
+	// Create a bytes.Reader from the gzip data
+	byteReader := bytes.NewReader(gzipData)
+
+	// Create a gzip reader
+	gzipReader, err := gzip.NewReader(byteReader)
+	if err != nil {
+		return "", err
+	}
+	defer gzipReader.Close()
+
+	// Read the uncompressed data
+	var result bytes.Buffer
+	_, err = io.Copy(&result, gzipReader)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert bytes buffer to string
+	return result.String(), nil
 }
 
 // extractExternalProcessingXDSRouteMetadataAttributes extracts the external processing attributes from the given data.

@@ -11,7 +11,7 @@ import (
 )
 
 // HandleHTTPRequestBody handles http request body
-func HandleHTTPRequestBody(requestID string, cacheStore datastore.CacheStore, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
+func HandleHTTPRequestBody(requestID string, cacheStore datastore.CacheStore, vectorStore VectorProvider, embeddingProvider EmbeddingProvider, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
 	httpBody := req.GetRequestBody().Body
 
 	var llmRequest dto.LLMRequest
@@ -26,10 +26,10 @@ func HandleHTTPRequestBody(requestID string, cacheStore datastore.CacheStore, ke
 		return
 	}
 
-	cachedResponse, err := CheckCacheForKey(key, cacheStore)
+	cachedResponse, err := CheckCacheForKey(key, cacheStore, vectorStore, embeddingProvider)
 	if err != nil {
 		fmt.Printf("[AI-CACHE] error retrieving key: %s from cache, error: %v", key, err)
-		keyStore.Set(requestID, key) // TODO: perform only if cache miss
+		keyStore.Set(requestID, key) // TODO: perform only if cache miss. return isHit and check as well. recheck
 		return
 	}
 
@@ -37,7 +37,7 @@ func HandleHTTPRequestBody(requestID string, cacheStore datastore.CacheStore, ke
 }
 
 // HandleHTTPResponseBody handles http response body
-func HandleHTTPResponseBody(requestID string, cacheStore datastore.CacheStore, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
+func HandleHTTPResponseBody(requestID string, cacheStore datastore.CacheStore, vectorStore VectorProvider, embeddingProvider EmbeddingProvider, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
 	httpBody := req.GetResponseBody().Body
 
 	var llmResponse dto.LLMResponse
@@ -65,5 +65,7 @@ func HandleHTTPResponseBody(requestID string, cacheStore datastore.CacheStore, k
 		return
 	}
 
+	// TODO: both should be asyncronous
 	cacheResponse(key, responseValue, cacheStore)
+	uploadEmbeddingAndAnswer(key, responseValue, vectorStore, embeddingProvider)
 }

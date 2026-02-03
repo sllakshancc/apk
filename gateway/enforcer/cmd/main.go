@@ -1,65 +1,71 @@
-package main
+package cache
 
 import (
-	"time"
+	"encoding/json"
+	"fmt"
 
-	"strings"
-
-	"github.com/wso2/apk/gateway/enforcer/internal/config"
+	envoy_service_proc_v3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/wso2/apk/gateway/enforcer/internal/datastore"
-	"github.com/wso2/apk/gateway/enforcer/internal/extproc"
-	"github.com/wso2/apk/gateway/enforcer/internal/grpc"
-	metrics "github.com/wso2/apk/gateway/enforcer/internal/metrics"
-	"github.com/wso2/apk/gateway/enforcer/internal/transformer"
+	"github.com/wso2/apk/gateway/enforcer/internal/dto"
 	"github.com/wso2/apk/gateway/enforcer/internal/util"
-	"github.com/wso2/apk/gateway/enforcer/internal/xds"
 )
 
-func main() {
-	cfg := config.GetConfig()
-	port := cfg.CommonControllerXdsPort
-	host := cfg.CommonControllerHostname
-	clientCert, err := util.LoadCertificates(cfg.EnforcerPublicKeyPath, cfg.EnforcerPrivateKeyPath)
+// HandleHTTPRequestBody handles http request body
+func HandleHTTPRequestBody(requestID string, cacheStore datastore.CacheStore, vectorStore VectorProvider, embeddingProvider EmbeddingProvider, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
+	httpBody := req.GetRequestBody().Body
+
+	var llmRequest dto.LLMRequest
+	if err := json.Unmarshal(httpBody, &llmRequest); err != nil {
+		fmt.Printf("[AI-CACHE] Error unmarshaling JSON Reuqest Body. %v", err)
+		return
+	}
+
+	key, has := llmRequest.GetKey()
+	if !has {
+		fmt.Printf("[AI-CACHE] cache key not found in request body.")
+		return
+	}
+
+	cachedResponse, err := CheckCacheForKey(key, cacheStore, vectorStore, embeddingProvider)
 	if err != nil {
-		panic(err)
+		fmt.Printf("[AI-CACHE] error retrieving key: %s from cache, error: %v", key, err)
+		keyStore.Set(requestID, key) // TODO: perform only if cache miss. return isHit and check as well. recheck
+		return
 	}
 
-	// Load the trusted CA certificates
-	certPool, err := util.LoadCACertificates(cfg.TrustedAdapterCertsPath)
+	SendCachedHTTPResponse(cachedResponse, resp)
+}
+
+// HandleHTTPResponseBody handles http response body
+func HandleHTTPResponseBody(requestID string, cacheStore datastore.CacheStore, vectorStore VectorProvider, embeddingProvider EmbeddingProvider, keyStore *datastore.IncomingRequestCacheKeyStore, req *envoy_service_proc_v3.ProcessingRequest, resp *envoy_service_proc_v3.ProcessingResponse) {
+	httpBody := req.GetResponseBody().Body
+
+	var llmResponse dto.LLMResponse
+
+	uncompressedBody, err := util.DecompressIfGzip(httpBody)
 	if err != nil {
-		panic(err)
+		fmt.Printf("[AI-CACHE] Error decompressing response body, error: %v", err)
+		return
 	}
 
-	//Create the TLS configuration
-	tlsConfig := util.CreateTLSConfig(clientCert, certPool)
-	subAppDatastore := datastore.NewSubAppDataStore(cfg)
-	client := grpc.NewEventingGRPCClient(host, port, cfg.XdsMaxRetries, time.Duration(cfg.XdsRetryPeriod)*time.Millisecond, tlsConfig, cfg, subAppDatastore)
-	// Start the connection
-	client.InitiateEventingGRPCConnection()
-
-	// Create the XDS clients
-	apiStore, configStore, jwtIssuerDatastore, modelBasedRoundRobinTracker := xds.CreateXDSClients(cfg)
-	// NewJWTTransformer creates a new instance of JWTTransformer.
-	jwtTransformer := transformer.NewJWTTransformer(jwtIssuerDatastore)
-	// Create new cache store and incomingstorecachekeystore
-	cacheStore := datastore.NewRedisCache()
-	incomingRequestCacheKeyStore := datastore.NewIncomingRequestCacheKeyStore()
-	// Start the external processing server
-	go extproc.StartExternalProcessingServer(cfg, apiStore, subAppDatastore, cacheStore, incomingRequestCacheKeyStore, jwtTransformer, modelBasedRoundRobinTracker)
-
-	// Wait for the config to be loaded
-	cfg.Logger.Info("Waiting for the config to be loaded")
-	<-configStore.Notify
-	cfg.Logger.Info("Config loaded successfully")
-	if len(configStore.GetConfigs()) > 0 && configStore.GetConfigs()[0].Analytics != nil && configStore.GetConfigs()[0].Analytics.Enabled {
-		// Start the access log service server
-		go grpc.StartAccessLogServiceServer(cfg, configStore)
-	}
-	// Start the metrics server
-	if cfg.Metrics.Enabled && strings.EqualFold(cfg.Metrics.Type, "prometheus") {
-		go metrics.StartPrometheusMetricsServer(cfg.Metrics.Port)
+	if err := json.Unmarshal(uncompressedBody, &llmResponse); err != nil {
+		fmt.Printf("[AI-CACHE] Error unmarshaling JSON Response Body, error: %v", err)
+		return
 	}
 
-	// Wait forever
-	select {}
+	key, hasKey := keyStore.Pop(requestID)
+	if !hasKey {
+		fmt.Printf("[AI-CACHE] cache key not found for request ID: %s", requestID)
+		return
+	}
+
+	responseValue, hasValue := llmResponse.GetValue()
+	if !hasValue {
+		fmt.Printf("[AI-CACHE] cached value for key %s is missing or empty", key)
+		return
+	}
+
+	// TODO: both should be asyncronous
+	cacheResponse(key, responseValue, cacheStore)
+	uploadEmbeddingAndAnswer(key, responseValue, vectorStore, embeddingProvider)
 }
